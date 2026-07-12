@@ -22,15 +22,67 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.tools import tool
+
+from tools import retrieve_relevant
+from helper_functions import llm_precise, llm_creative
 
 # ============================================================
-# 复用 v5.0 的工具、安全审核、质检
+# 复用 v4.0 的安全审核、质检（从 agent.py 导入）
 # ============================================================
-from agent_v5 import (
-    TOOLS, SYSTEM_PROMPT,
-    llm_with_tools,
-    check_input_safety, check_output
-)
+from agent import check_input_safety, check_output
+
+# ============================================================
+# 工具定义（原来在 agent_v5.py 中）
+# ============================================================
+
+@tool
+def search_knowledge(question: str) -> str:
+    """搜索云帆科技公司知识库。当用户询问公司信息、产品功能、价格方案、
+    使用方法、常见问题、技术规格等知识类问题时，必须使用此工具。
+
+    Args:
+        question: 用户的具体问题，用完整自然语言描述。
+    """
+    return retrieve_relevant(question)
+
+
+@tool
+def check_order(order_id: str) -> str:
+    """根据订单号查询订单的物流状态和发货进度。
+    当用户提供订单号并询问订单状态、发货情况、物流信息时使用此工具。
+
+    Args:
+        order_id: 订单号，格式为 ORD- 开头加数字编号，例如 ORD-2024001。
+    """
+    mock_orders = {
+        "ORD-2024001": "已发货 | 顺丰 SF1234567890 | 预计7月3日送达",
+        "ORD-2024002": "处理中 | 预计7月2日发货",
+        "ORD-2024003": "已签收 | 6月28日签收",
+    }
+    result = mock_orders.get(order_id, "未找到该订单，请确认订单号是否正确。")
+    return f"订单 {order_id} 状态：{result}"
+
+
+@tool
+def check_refund_policy() -> str:
+    """查询云帆科技公司的退款政策和退款流程。
+    当用户询问退款条件、退款金额、退款流程、退款时效时使用此工具。
+    """
+    return retrieve_relevant("退款 退款政策 退款流程 退款条件")
+
+
+TOOLS = [search_knowledge, check_order, check_refund_policy]
+
+SYSTEM_PROMPT = """你是云帆科技的智能客服助手。你的职责是：
+1. 理解用户问题，判断需要使用哪个工具来获取信息
+2. 调用合适的工具获取必要信息
+3. 基于工具返回的结果，用自然、友好的语气回答用户
+4. 如果手头信息不足以回答，如实告知并建议联系人工客服 400-888-6666
+重要：绝对不要编造工具返回结果中没有的信息。"""
+
+# llm_precise(t=0) 绑定工具
+llm_with_tools = llm_precise.bind_tools(TOOLS)
 
 # ============================================================
 # 第1部分：AgentState 定义
