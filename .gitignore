@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Chroma 向量库
+chroma_db/
+
+# Claude Code 本地配置
+.claude/
+
+# IDE
+.vscode/
+.idea/
