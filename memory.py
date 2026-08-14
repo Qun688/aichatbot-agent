@@ -52,25 +52,39 @@ def save_user_memory(user_id: str, content: str):
     store.put((APP_NAMESPACE, user_id), key, {"content": content})
 
 
-def extract_memory(user_input: str, reply: str) -> str | None:
+def extract_memory(user_input: str, reply: str, existing_memory: str = "") -> str | None:
     """用 LLM 从一轮对话中提取值得长期记住的用户信息
 
-    返回：提炼出的一句事实（如"用户喜欢简洁的回复"），没有则返回 None
+    Args:
+        user_input: 用户输入
+        reply: 客服回复
+        existing_memory: 该用户已有的记忆（用于去重，避免重复提取）
+
+    返回：提炼出的一句事实（如"用户喜欢简洁的回复"），没有新信息则返回 None
     """
-    prompt = f"""分析下面这段客服对话，判断用户是否透露了值得长期记住的信息。
+    prompt = f"""分析下面这段客服对话，判断用户是否透露了值得长期记住的【新】信息。
 
 值得记住的信息包括：
 - 用户的姓名、身份、职业
 - 用户的偏好（如"喜欢简洁的回复"、"希望用正式语气"）
 - 用户提到的重要背景（如"我是学生"、"我们公司有100人"）
 
-如果没有任何值得记住的信息，只回复"无"。
-如果有，用一句简洁的事实陈述（提炼成客观事实，不要复述原话）。
+如果没有任何值得记住的【新】信息，只回复"无"。
+如果有新信息，用一句简洁的事实陈述（提炼成客观事实，不要复述原话）。
 
 用户说：{user_input}
-客服回复：{reply}
+客服回复：{reply}"""
 
-值得记住的信息（没有就回复"无"）："""
+    # 如果已有记忆，告诉 LLM 不要重复记录
+    if existing_memory:
+        prompt += f"""
+
+【该用户已有的记忆】（不要重复记录这些）
+{existing_memory}"""
+
+    prompt += """
+
+值得记住的新信息（没有就回复"无"）："""
 
     result = llm_precise.invoke(prompt).content.strip()
     if not result or result == "无":

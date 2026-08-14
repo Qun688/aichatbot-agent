@@ -353,7 +353,9 @@ def process_message(user_input: str, thread_id: str = "default", user_id: str = 
             reply = ai_msgs[-1].content
 
             # 对话结束后，用 LLM 提取值得记住的用户信息，存入长期记忆
-            memory = extract_memory(user_input, reply)
+            # 先查已有记忆，避免重复提取
+            existing = get_user_memory(user_id)
+            memory = extract_memory(user_input, reply, existing)
             if memory:
                 save_user_memory(user_id, memory)
                 print(f"  [记忆: 已记住「{memory}」]")
