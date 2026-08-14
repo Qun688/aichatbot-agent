@@ -17,6 +17,7 @@ from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
+from huggingface_hub import snapshot_download
 
 # ========== 全局单例：只加载一次 ==========
 _vectorstore = None
@@ -45,9 +46,12 @@ def _init_vectorstore():
 
     # 第3步：向量化 + 存入 Chroma（课6 L3）
     # 使用本地中文模型，离线可用，无需 API Key
-    embeddings = HuggingFaceEmbeddings(
-        model_name="shibing624/text2vec-base-chinese"
+    # 用 local_files_only=True 从本地缓存找路径，避免联网下载缺的配置文件
+    model_path = snapshot_download(
+        repo_id="shibing624/text2vec-base-chinese",
+        local_files_only=True,
     )
+    embeddings = HuggingFaceEmbeddings(model_name=model_path)
 
     _vectorstore = Chroma.from_documents(
         documents=chunks,
