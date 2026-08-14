@@ -85,6 +85,7 @@ async def chat(request: ChatRequest):
         reply = process_message(
             user_input=request.message,
             thread_id=request.thread_id,
+            user_id=request.user_id,
         )
         return ChatResponse(reply=reply, thread_id=request.thread_id)
 

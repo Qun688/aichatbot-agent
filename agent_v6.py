@@ -29,6 +29,7 @@ from langchain_core.tools import tool
 
 from tools import retrieve_relevant
 from helper_functions import llm_precise, llm_creative
+from memory import get_user_memory, save_user_memory, extract_memory
 
 # ============================================================
 # 复用 v4.0 的安全审核、质检（从 agent.py 导入）
@@ -95,6 +96,7 @@ class AgentState(TypedDict):
     """贯穿所有节点的共享状态"""
     messages: Annotated[list[BaseMessage], add_messages]
     safety_passed: bool
+    user_id: str
 
 
 # ============================================================
@@ -120,7 +122,13 @@ def agent_node(state: AgentState) -> dict:
     """节点3：LLM 分析消息历史，决定是否调用工具"""
     messages = state["messages"]
     if not any(isinstance(m, SystemMessage) for m in messages):
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+        # 查用户的长期记忆，注入 system prompt（课7 Memory Store）
+        user_id = state.get("user_id", "anonymous")
+        memory_text = get_user_memory(user_id)
+        enhanced_prompt = SYSTEM_PROMPT
+        if memory_text:
+            enhanced_prompt += f"\n\n【关于该用户的长期记忆】\n{memory_text}\n（如与当前对话相关，自然地运用这些信息）"
+        messages = [SystemMessage(content=enhanced_prompt)] + messages
     response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
 
@@ -310,17 +318,18 @@ def _format_node_event(node_name: str, node_output: dict) -> str:
 # 第7部分：对外入口
 # ============================================================
 
-def process_message(user_input: str, thread_id: str = "default") -> str:
-    """用 LangGraph 图执行一轮对话（支持流式输出 + 持久化）
+def process_message(user_input: str, thread_id: str = "default", user_id: str = "anonymous") -> str:
+    """用 LangGraph 图执行一轮对话（支持流式输出 + 持久化 + 长期记忆）
 
     Args:
         user_input: 用户输入
         thread_id: 线程 ID，同一线程保持对话上下文
+        user_id: 用户 ID，用于跨会话的长期记忆
     """
     _ensure_thread_meta(thread_id, user_input)
 
     config = {"configurable": {"thread_id": thread_id}}
-    input_state = {"messages": [HumanMessage(content=user_input)]}
+    input_state = {"messages": [HumanMessage(content=user_input)], "user_id": user_id}
 
     print(f"  [{_get_thread_title(thread_id)}] ", end="")
 
@@ -341,6 +350,14 @@ def process_message(user_input: str, thread_id: str = "default") -> str:
         ai_msgs = [m for m in final_state.values.get("messages", [])
                    if isinstance(m, AIMessage)]
         if ai_msgs:
-            return ai_msgs[-1].content
+            reply = ai_msgs[-1].content
+
+            # 对话结束后，用 LLM 提取值得记住的用户信息，存入长期记忆
+            memory = extract_memory(user_input, reply)
+            if memory:
+                save_user_memory(user_id, memory)
+                print(f"  [记忆: 已记住「{memory}」]")
+
+            return reply
 
     return "抱歉，系统处理出现异常，请稍后重试或拨打 400-888-6666。"
