@@ -36,9 +36,10 @@ def _init_vectorstore():
     docs = loader.load()
 
     # 第2步：切分文档（课6 L2）
+    # chunk_size 调大到 700：让每个块内容更完整，避免 FAQ 问答被切碎
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=300,
-        chunk_overlap=50,
+        chunk_size=700,
+        chunk_overlap=100,
         separators=["\n\n", "\n", "。", "，", " ", ""]
     )
     chunks = splitter.split_documents(docs)
