@@ -8,6 +8,10 @@ venv/
 # Chroma 向量库
 chroma_db/
 
+# 运行时数据（对话历史持久化）
+checkpoints.db
+thread_meta.json
+
 # Claude Code 本地配置
 .claude/
 

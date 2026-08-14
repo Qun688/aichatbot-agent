@@ -16,11 +16,14 @@ v6.0 完整特性：
 """
 from typing import TypedDict, Annotated
 from datetime import datetime
+import json
+import os
+import sqlite3
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
 
@@ -151,10 +154,12 @@ def route_after_safety(state: AgentState) -> str:
 
 
 # ============================================================
-# 第4部分：构建并编译图（注入 MemorySaver）
+# 第4部分：构建并编译图（注入 SqliteSaver 持久化）
 # ============================================================
 
-_checkpointer = MemorySaver()
+# 用 sqlite3 连接构造 SqliteSaver，checkpoints.db 存对话历史，重启不丢
+_conn = sqlite3.connect("checkpoints.db", check_same_thread=False)
+_checkpointer = SqliteSaver(_conn)
 
 
 def build_graph():
@@ -192,11 +197,28 @@ agent_graph = build_graph()
 
 
 # ============================================================
-# 第5部分：线程元数据管理
+# 第5部分：线程元数据管理（JSON 文件持久化，重启不丢）
 # ============================================================
 
-# 存储线程的元信息（MemorySaver 只存消息状态，标题/创建时间由我们管理）
-_thread_meta: dict[str, dict] = {}
+META_FILE = "thread_meta.json"
+
+
+def _load_thread_meta() -> dict:
+    """从 JSON 文件加载线程元数据"""
+    if os.path.exists(META_FILE):
+        with open(META_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_thread_meta():
+    """把线程元数据保存到 JSON 文件"""
+    with open(META_FILE, "w", encoding="utf-8") as f:
+        json.dump(_thread_meta, f, ensure_ascii=False, indent=2)
+
+
+# 存储线程的元信息（标题/创建时间，跟随 SqliteSaver 一起持久化）
+_thread_meta: dict[str, dict] = _load_thread_meta()
 
 
 def _get_thread_title(thread_id: str) -> str:
@@ -213,6 +235,7 @@ def _ensure_thread_meta(thread_id: str, first_message: str = ""):
             "title": title if title else "新对话",
             "created_at": datetime.now().strftime("%m-%d %H:%M"),
         }
+        _save_thread_meta()
 
 
 def list_threads() -> list[dict]:
