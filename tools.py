@@ -5,21 +5,30 @@
 v3.0: search_knowledge_base() 用 if "退款" in line 关键词匹配
 v4.0: retrieve_relevant() 用 Chroma 向量语义检索
 v8.1: 向量库改为"按内容指纹复用"，修掉每次启动都重复写入的 bug
+v9.0: 切块改为"先按【章节】切、再在章节内细分"，修掉检索串题的问题
+v9.1: 【常见问题】改为按"一问一答"切块，问题不再被合并稀释
+      （v9.0 实测"怎么开发票"检索不到，就是因为发票那条问答
+        和支付方式、数据导出等 4 条不相关的问答挤在同一个块里）
 
-【v8.1 修的是什么】
-旧代码是 Chroma.from_documents(..., persist_directory="./chroma_db")，
-它每次启动都把同一批知识块【追加】进同一个集合里。跑 10 次，知识库里
-就有 10 份重复内容（实测 chroma.sqlite3 里同一段话出现了约 10 次），
-导致 similarity_search(k=3) 经常返回 3 个几乎一样的块，白白占用上下文。
+【v9.0 修的是什么】
+旧代码用 RecursiveCharacterTextSplitter 直接对整篇文档按 700 字硬切，
+结果【退换政策】这种只有 6 行的小节，和【产品与服务】【产品与定价】这些
+完全不相关的内容被塞进了同一个块。实测问"退款政策是什么"：
 
-现在的做法：
-  集合名 = "kb_" + 知识库内容指纹
-  → 内容没变，就是同一个集合，直接复用（不再重新向量化，启动更快）
-  → 内容/切块参数/向量模型变了，指纹就变，自动用新集合重建
-  → 永远不会重复累积
+    第1名 → 荣誉资质 + 产品与服务 + 产品与定价   （完全不相关）
+    第2名 → 常见问题                              （部分相关）
+    第3名 → 才轮到真正的【退换政策】              （真正相关，却排最后）
+
+现在知识库只有 6 个块、k=3 等于捞出半个库，所以还能歪打正着。
+但知识库一旦变大，真正的政策块就会被挤出 top-3，
+客服就会在"没有拿到政策原文"的情况下编答案（幻觉）。
+
+改成先按【章节标题】切开（共 9 个章节），章节内部再按 400 字细分，
+保证每个块主题单一，检索排名就正过来了。
 """
 import hashlib
 import os
+import re
 
 # 必须在导入 HuggingFace 之前设置
 # 1. 镜像站：防止被墙
@@ -40,15 +49,24 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 KNOWLEDGE_FILE = os.path.join(BASE_DIR, "knowledge.txt")
 PERSIST_DIR = os.path.join(BASE_DIR, "chroma_db")
 
-# 切块参数提成常量：它一变，指纹就变，会自动触发重建
-CHUNK_SIZE = 700
-CHUNK_OVERLAP = 100
+# 章节内部的细分参数（整篇文档不再按这个尺寸硬切）
+CHUNK_SIZE = 400
+CHUNK_OVERLAP = 50
 SEPARATORS = ["\n\n", "\n", "。", "，", " ", ""]
+
+# 切分策略的版本号：策略一改就把这里也改掉，
+# 指纹会跟着变 → 向量库自动重建，不会拿旧切法的库来用
+SPLIT_VERSION = "v9.1-section-qa"
+
+# 问答格式的分隔点：knowledge.txt 的【常见问题】是 "Q: ...\nA: ..." 一段一对。
+# 一问一答本身就是完整的语义单元，如果再按字数合并，
+# 就会把"发票""密码""试用期"这些不相关的问题混进同一个向量里互相稀释。
+QA_SPLIT_RE = re.compile(r"\n(?=Q[:：])")
 
 # 本地中文向量模型（离线可用，不需要 API Key）
 MODEL_REPO = "shibing624/text2vec-base-chinese"
 
-# 旧版本用的默认集合名（里面已经堆积了重复数据），初始化成功后顺手清掉
+# 旧版本用的默认集合名（里面堆积了重复数据），初始化成功后顺手清掉
 LEGACY_COLLECTIONS = ["langchain"]
 
 # ========== 全局单例：只加载一次 ==========
@@ -63,13 +81,13 @@ def _count(store) -> int:
 def _knowledge_fingerprint(text: str) -> str:
     """算知识库的"内容指纹"
 
-    把【文件内容 + 向量模型 + 切块参数】一起做 SHA256。
+    把【文件内容 + 向量模型 + 切分策略/参数】一起做 SHA256。
     其中任何一项变了，指纹就变 → 集合名变 → 自动用全新的集合重建，
     所以永远不会出现"新旧内容混在一起、越积越多"的情况。
     """
     h = hashlib.sha256()
     h.update(text.encode("utf-8"))
-    h.update(f"|{MODEL_REPO}|{CHUNK_SIZE}|{CHUNK_OVERLAP}".encode("utf-8"))
+    h.update(f"|{MODEL_REPO}|{SPLIT_VERSION}|{CHUNK_SIZE}|{CHUNK_OVERLAP}".encode("utf-8"))
     return h.hexdigest()
 
 
@@ -83,20 +101,85 @@ def _load_embeddings() -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(model_name=model_path)
 
 
-def _split_knowledge() -> list:
-    """第1、2步：加载文档 → 切块（课6 L1 + L2）"""
-    loader = TextLoader(KNOWLEDGE_FILE, encoding="utf-8")
-    docs = loader.load()
+def _split_by_section(text: str) -> list:
+    """把知识库按【章节标题】切成 [(标题, 正文), ...]
 
-    # chunk_size 700：让每个块内容更完整，避免 FAQ 问答被切碎
+    识别规则：整行就是 【xxx】 的行算章节标题（knowledge.txt 里共 9 个）。
+    第一个标题之前的内容（文档大标题）并入第一节，避免产生"只有一个标题"的无效块。
+    """
+    sections = []
+    title = None
+    buf = []
+
+    def flush():
+        body = "\n".join(buf).strip()
+        if body:
+            sections.append((title, body))
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("【") and stripped.endswith("】"):
+            flush()          # 先收好上一节
+            title = stripped  # 开新的一节
+            buf = [line]
+        else:
+            buf.append(line)
+    flush()
+
+    # 把文档大标题并进第一节
+    if sections and sections[0][0] is None:
+        head = sections.pop(0)[1]
+        if sections:
+            first_title, first_body = sections[0]
+            sections[0] = (first_title, f"{head}\n{first_body}")
+    return sections
+
+
+def _split_body(body: str, splitter) -> list:
+    """切一节正文
+
+    - 问答格式（【常见问题】）：按"一问一答"切，一条问答一个块
+    - 其他章节：按字数细分（章节内部已经是同一主题，切碎一点没关系）
+    """
+    if QA_SPLIT_RE.search(body):
+        pairs = [p.strip() for p in QA_SPLIT_RE.split(body) if p.strip()]
+        pieces = []
+        for pair in pairs:
+            # 万一某一条问答特别长，再用字数兜底细分
+            pieces.extend(splitter.split_text(pair) if len(pair) > CHUNK_SIZE else [pair])
+        return pieces
+    return splitter.split_text(body)
+
+
+def _split_knowledge() -> list:
+    """第1、2步：加载文档 → 先按章节切、章节内再细分（课6 L1 + L2）"""
+    # 第1步：加载文档（课6 L1）
+    loader = TextLoader(KNOWLEDGE_FILE, encoding="utf-8")
+    text = loader.load()[0].page_content
+
+    # 第2步：切分文档（课6 L2）
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         separators=SEPARATORS,
     )
-    chunks = splitter.split_documents(docs)
-    print(f"  文档已切分为 {len(chunks)} 个块")
-    return chunks
+
+    from langchain_core.documents import Document
+
+    docs = []
+    sections = _split_by_section(text)
+    for title, body in sections:
+        pieces = _split_body(body, splitter)
+        for i, piece in enumerate(pieces):
+            # 每块都带上章节标题：既是上下文，也让 embedding 更容易命中主题
+            content = f"{title}\n{piece}" if title else piece
+            docs.append(Document(
+                page_content=content,
+                metadata={"section": title or "", "source": "knowledge.txt", "part": i},
+            ))
+
+    print(f"  文档切成 {len(sections)} 个章节，共 {len(docs)} 个块")
+    return docs
 
 
 def _drop_legacy_collections(embeddings):
@@ -116,6 +199,24 @@ def _drop_legacy_collections(embeddings):
                 print(f"  已清理旧集合 '{name}'（历史重复数据）")
         except Exception:
             pass  # 集合不存在 / 删除失败都忽略
+
+
+def _drop_stale_kb_collections(store, keep: str):
+    """清理知识库改版后遗留的旧 kb_* 集合，只保留当前这个"""
+    try:
+        names = [
+            c if isinstance(c, str) else getattr(c, "name", "")
+            for c in store._client.list_collections()
+        ]
+    except Exception:
+        return
+    for name in names:
+        if name.startswith("kb_") and name != keep:
+            try:
+                store._client.delete_collection(name)
+                print(f"  已清理过期集合 '{name}'")
+            except Exception:
+                pass
 
 
 def _init_vectorstore(force_rebuild: bool = False):
@@ -152,7 +253,7 @@ def _init_vectorstore(force_rebuild: bool = False):
         _vectorstore = store
         return
 
-    print("  [初始化 RAG：加载文档 → 切块 → 向量化]")
+    print("  [初始化 RAG：加载文档 → 按章节切块 → 向量化]")
 
     if force_rebuild and count > 0:
         # 强制重建：先把当前集合清空，否则又会追加成重复数据
@@ -170,8 +271,9 @@ def _init_vectorstore(force_rebuild: bool = False):
     store.add_documents(chunks)  # Chroma 会自动落盘
     print(f"  向量库初始化完成（{len(chunks)} 个块，集合 {collection_name}）")
 
-    # 顺手清掉旧版本堆积的重复集合
+    # 顺手清掉历史遗留的集合（旧的默认集合 + 旧版切法留下的 kb_* 集合）
     _drop_legacy_collections(embeddings)
+    _drop_stale_kb_collections(store, collection_name)
 
     _vectorstore = store
 
@@ -188,11 +290,17 @@ def retrieve_relevant(query: str, k: int = 3) -> str:
 
 if __name__ == "__main__":
     # 手动自检用法：
-    #   python tools.py            检查/构建向量库，并跑一条测试检索
+    #   python tools.py            检查/构建向量库，并跑几条测试检索看排名
     #   python tools.py --rebuild  强制重建（改了 knowledge.txt 但指纹没生效时用）
     import sys
 
     _init_vectorstore(force_rebuild="--rebuild" in sys.argv)
     print(f"\n向量库块数：{_count(_vectorstore)}")
-    print("\n[测试检索] 退款政策是什么？")
-    print(retrieve_relevant("退款政策是什么", k=3))
+
+    # 用几条典型问题验证检索排名（分数是距离，越小越相关）
+    for q in ["退款政策是什么", "怎么开发票", "OA 专业版多少钱", "数据安全吗",
+              "忘记密码怎么办", "有试用期吗"]:
+        print(f"\n[检索] {q}")
+        for doc, score in _vectorstore.similarity_search_with_score(q, k=3):
+            section = doc.metadata.get("section", "?")
+            print(f"  [{score:.3f}] {section} | {doc.page_content[:30]}...")
