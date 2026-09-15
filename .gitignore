@@ -9,9 +9,9 @@ venv/
 chroma_db/
 
 # 运行时数据（对话历史持久化）
-checkpoints.db
+checkpoints.db*
+memory_store.db*
 thread_meta.json
-memory_store.db
 
 # Claude Code 本地配置
 .claude/

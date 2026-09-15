@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from langchain_core.messages import HumanMessage, AIMessage
 
 # ---- 导入你已有的 Agent 核心逻辑 ----
 from agent_v6 import (
@@ -98,19 +99,24 @@ async def get_history(thread_id: str):
     """
     GET /history/{thread_id}  —— 查看某个线程的对话历史
 
+    只返回真正的对话（用户消息 + 客服回复），
+    过滤掉工具调用的中间过程（"调用工具"指令 + 工具返回结果），
+    这样前端界面只显示干净的聊天内容。
+
     例: GET http://localhost:8000/history/user_001
     """
     messages = get_thread_messages(thread_id)
-    return {
-        "thread_id": thread_id,
-        "messages": [
-            {
-                "role": "user" if m.__class__.__name__ == "HumanMessage" else "assistant",
-                "content": m.content,
-            }
-            for m in messages
-        ],
-    }
+    clean = []
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            # 用户消息
+            clean.append({"role": "user", "content": m.content})
+        elif isinstance(m, AIMessage) and not m.tool_calls:
+            # 只有"没有 tool_calls 的 AI 消息"才是真正的回复；
+            # 带 tool_calls 的是"我要调用工具"的指令，不是给用户看的，跳过
+            clean.append({"role": "assistant", "content": m.content})
+        # ToolMessage（工具返回结果）直接跳过，不展示
+    return {"thread_id": thread_id, "messages": clean}
 
 
 @app.get("/threads", response_model=list[ThreadInfo])
