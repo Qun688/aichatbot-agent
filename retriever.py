@@ -19,8 +19,6 @@
 设计上刻意不依赖 langchain 的 EnsembleRetriever：
 一是少一层依赖，二是 RRF 自己实现只要十几行，面试时能讲清每一步。
 """
-import os
-
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 

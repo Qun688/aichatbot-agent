@@ -21,6 +21,10 @@ from agent_v6 import process_message, list_threads, get_thread_messages, agent_g
 # 当前活跃线程
 current_thread = "default"
 
+# 命令行身份：长期记忆按 user_id 隔离，这里显式区分于网页端。
+# 不传的话会落到默认的 "anonymous"，和网页端共用同一个记忆空间。
+CLI_USER = "cli_user"
+
 
 def print_banner():
     """启动横幅"""
@@ -153,7 +157,7 @@ def main():
             continue
 
         # 正常对话（流式输出由 process_message 内部处理）
-        reply = process_message(user_input, thread_id=current_thread)
+        reply = process_message(user_input, thread_id=current_thread, user_id=CLI_USER)
         print(f"\n客服：{reply}\n")
 
 
