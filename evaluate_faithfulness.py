@@ -30,6 +30,11 @@ import agent_v6
 from evaluate_retrieval import TEST_SET
 from helper_functions import get_llm_response
 
+# 用来识别"质检护栏介入"（答案被兜底话术替换）。
+# 这个指标是必要的：兜底话术本身永远是"忠实"的，
+# 如果护栏误杀全部回答，忠实率反而会显示 100% —— 那是评测的盲区。
+GUARD_MARK = agent_v6.QUALITY_FALLBACK[:12]
+
 # 测试用的身份：线程跑完会清理掉，不会污染你正常的对话列表
 TEST_USER = "faith_eval"
 THREAD_PREFIX = "faith_eval_"
@@ -202,15 +207,18 @@ def main():
             "faithful": False, "relevant": None, "reason": "未调用知识库工具，无法核对"
         }
 
+        guarded = GUARD_MARK in result["answer"]
         rows.append({
             "q": case["q"], "answer": result["answer"], "tool_called": tool_called,
+            "guarded": guarded,
             "facts_total": len(supported) + len(unsupported),
             "unsupported": unsupported, **verdict,
         })
 
         print(f"  工具调用: {'是' if tool_called else '❌ 否'}"
               f" | 事实片段: {len(supported)} 证实 / {len(unsupported)} 存疑"
-              f" | 忠实: {verdict['faithful']} | 相关: {verdict['relevant']}")
+              f" | 忠实: {verdict['faithful']} | 相关: {verdict['relevant']}"
+              f"{' | ⚠️ 护栏介入' if guarded else ''}")
 
     # ---------------- 汇总 ----------------
     n = len(rows)
@@ -234,6 +242,9 @@ def main():
               f"   （分母只算「检索过且含可验证事实」的题）")
     print(f"  LLM 判定忠实率  : {len(faithful)}/{n} = {len(faithful) / n * 100:.1f}%")
     print(f"  LLM 判定相关性  : {len(relevant)}/{n} = {len(relevant) / n * 100:.1f}%")
+    guarded = [r for r in rows if r["guarded"]]
+    print(f"  质检护栏介入    : {len(guarded)}/{n} = {len(guarded) / n * 100:.1f}%"
+          f"   （介入 = 答案被兜底话术替换，需人工确认是否误杀）")
 
     bad = [r for r in rows if r["unsupported"] or r["faithful"] is False]
     if bad:

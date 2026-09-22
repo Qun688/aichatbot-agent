@@ -76,36 +76,45 @@ python evaluate_retrieval.py
 
 | 文件 | 作用 | 对应知识点 |
 |------|------|-----------|
-| `agent_v6.py` | Agent 核心：LangGraph 状态图 + 工具调用 | 课4 LangGraph |
-| `tools.py` | RAG 向量检索（Chroma + 中文向量模型） | 课6 RAG |
+| `agent_v6.py` | **Agent 核心**：LangGraph 状态图 + 工具调用 + 输出质检护栏 | 课4 LangGraph |
+| `tools.py` | **RAG 索引层**：章节感知切块 + 按内容指纹复用向量库 | 课6 RAG |
+| `retriever.py` | **混合检索层**：BM25 + 向量 RRF 融合 + cross-encoder 重排 | RAG 进阶 |
+| `evaluate_retrieval.py` | **检索评测**：22 题、三代方案对比（Hit@k / MRR） | 评测 |
+| `evaluate_faithfulness.py` | **幻觉评测**：工具调用率 + 数字溯源 + LLM 忠实度裁判 | 评测 |
 | `memory.py` | 长期记忆（SqliteStore 跨会话记用户） | 课7 长期记忆 |
 | `api.py` | FastAPI 接口（REST API） | 工程化 |
 | `app.py` | Streamlit 网页界面（前端） | 工程化 |
 | `helper_functions.py` | LLM 客户端（DeepSeek/OpenAI 兼容） | 课5 |
-| `knowledge.txt` | 知识库（公司 FAQ 文档） | 数据 |
-| `checkpoints.db` | 对话历史持久化（自动生成） | 运行时数据 |
-| `memory_store.db` | 长期记忆库（自动生成） | 运行时数据 |
+| `main_v6.py` | 命令行入口（多线程对话管理） | 工程化 |
+| `knowledge.txt` | 知识库（公司 FAQ，共 9 个章节 / 25 个块） | 数据 |
+| `agent.py` · `main.py` | 历史版本（v4 流水线 / v3 CLI）；注意 `agent.py` 的审核与质检函数**仍被当前版本复用** | 演进记录 |
+| `checkpoints.db` · `memory_store.db` | 对话历史 / 长期记忆（自动生成，已 gitignore） | 运行时数据 |
 
 ---
 
 ## 四、快速开始
 
-### 1. 安装依赖
+### 1. 准备环境
 
-```bash
-pip install -r requirements.txt
+项目自带虚拟环境 `.venv`，**请务必用它**：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+> ⚠️ 不要用裸 `python`。系统 PATH 上的 Python 和项目 `.venv` 是**两套独立环境**，
+> 全局环境可能缺少依赖（表现为 `ModuleNotFoundError`）。
 
 ### 2. 配置 API Key
 
 项目使用 DeepSeek 大模型（也兼容 OpenAI），需要设置环境变量：
 
-```bash
-# Windows (CMD)
-set DEEPSEEK_API_KEY=你的key
-
-# Windows (PowerShell)
+```powershell
+# Windows (PowerShell) —— 当前窗口临时生效
 $env:DEEPSEEK_API_KEY="你的key"
+
+# 永久生效（写入用户环境变量，需重开终端）
+[Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "你的key", "User")
 ```
 
 > 也可以改用 OpenAI：设置 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL` 即可。
@@ -114,14 +123,14 @@ $env:DEEPSEEK_API_KEY="你的key"
 
 #### 方式一：命令行（最简单）
 
-```bash
-python main_v6.py
+```powershell
+.\.venv\Scripts\python.exe main_v6.py
 ```
 
 #### 方式二：REST API
 
-```bash
-uvicorn api:app --reload
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn api:app --reload
 # 打开 http://localhost:8000/docs 查看接口文档
 ```
 
@@ -129,15 +138,28 @@ uvicorn api:app --reload
 
 需要开两个终端：
 
-```bash
+```powershell
 # 终端1：先启动后端 API
-uvicorn api:app --reload
+.\.venv\Scripts\python.exe -m uvicorn api:app --reload
 
 # 终端2：再启动前端界面
-streamlit run app.py
+.\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
-浏览器自动打开 `http://localhost:8501`，就能和客服对话了。
+浏览器打开 `http://localhost:8501` 就能和客服对话。
+
+> **在 VS Code 里更省事**：直接按 `Ctrl+Shift+B` 一键启动。
+> `.vscode/tasks.json` 里写死了 `.venv` 的完整路径，不会用错解释器。
+
+### 4. 跑评测（可选，用来验证检索与幻觉指标）
+
+```powershell
+# 检索评测：22 题、三代方案对比（纯本地计算，免费，约 2 分钟）
+.\.venv\Scripts\python.exe evaluate_retrieval.py
+
+# 幻觉评测：跑完整 Agent 链路（需要 LLM 调用，约 8 分钟）
+.\.venv\Scripts\python.exe evaluate_faithfulness.py
+```
 
 ---
 
@@ -167,7 +189,8 @@ print(resp.json()["reply"])
 
 - **LangGraph** —— Agent 编排框架（状态图）
 - **LangChain** —— 工具封装、消息处理
-- **ChromaDB + text2vec** —— 向量检索（RAG）
+- **ChromaDB + text2vec** —— 向量检索（RAG 基础层）
+- **BM25（rank_bm25 + jieba 分词）+ BAAI/bge-reranker-base** —— 混合检索与重排
 - **SqliteSaver / SqliteStore** —— 对话持久化 / 长期记忆
 - **FastAPI + uvicorn** —— 后端接口
 - **Streamlit** —— 前端界面
@@ -185,3 +208,6 @@ print(resp.json()["reply"])
 | v6 | LangGraph 状态图 + SqliteSaver 持久化 + 多线程对话 |
 | v7 | FastAPI 接口 + 长期记忆（Memory Store） |
 | v8 | Streamlit 网页界面 + 知识库扩充 |
+| v8.1 | 向量库按内容指纹复用（修掉重复累积）；网页端按用户隔离长期记忆 |
+| v9 | 章节感知切块（FAQ 按一问一答切），检索 Hit@1 54.5% → 72.7% |
+| v10 | 混合检索（BM25 + 向量 RRF 融合）+ cross-encoder 重排，Hit@1 → 100%；新增检索/幻觉评测脚本；质检节点接上输出护栏 |

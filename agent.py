@@ -2,6 +2,13 @@
 智能客服 Agent v4.0 —— 课6升级版
 RAG 向量检索替代关键词匹配
 
+⚠️ 本文件有两重身份，改代码前先看清楚：
+  1. process_message() 是 v4.0 的老流水线，已被 agent_v6.py 的 LangGraph
+     状态图取代（main.py 还在用它），保留作"版本演进"的对照实现；
+  2. 但 check_input_safety() / check_output() 这两个函数**仍被当前版本复用**
+     —— agent_v6.py 从这里 import 它们做输入审核和输出质检。
+     所以本文件不是纯粹的遗留代码，修改时要保证这两个函数的兼容性。
+
 升级对比：
   v3.0: ChatPromptTemplate + StrOutputParser + | 管道语法 + 关键词搜索
   v4.0: 同上 + 向量语义检索（Chroma RAG）
@@ -139,20 +146,41 @@ def handle_query(user_input: str, category: str) -> str:
 
 
 # ========== 第5步：输出质检 ==========
-check_template = ChatPromptTemplate.from_template("""检查以下客服回复：
-1. 是否编造了不存在的信息（幻觉）？
+# v10.1：模板里加入 {context}（本次检索到的资料）。
+# 少了它，质检只能凭自己的知识判断"有没有编造"，而本项目知识库是虚构内容，
+# 结果会把正确回答误判成幻觉 —— 这个坑是实测踩出来的。
+check_template = ChatPromptTemplate.from_template("""检查以下客服回复。
+
+【参考资料】（客服回答应当以此为准）
+{context}
+
+【用户问题】
+{question}
+
+【客服回复】
+{reply}
+
+请依次检查：
+1. 是否编造了参考资料里没有的信息（幻觉）？
+   —— 只依据参考资料判断；礼貌用语、"建议联系人工客服"这类不算编造。
 2. 语气是否礼貌？
 3. 是否回答了用户问题？
-回复完全合适则回答"通过"，否则回答"有问题："并说明。
-用户问题：{question}
-客服回复：{reply}""")
+回复完全合适则只回答"通过"，否则回答"有问题："并说明。""")
 
 check_chain = check_template | llm_precise | StrOutputParser()
 
 
-def check_output(bot_reply: str, user_input: str) -> str:
-    """最后一道质检"""
-    return check_chain.invoke({"reply": bot_reply, "question": user_input}).strip()
+def check_output(bot_reply: str, user_input: str, context: str = "") -> str:
+    """最后一道质检
+
+    context = 本次回答用到的检索资料（v10.1 新增，必须传）。
+    不传的话质检无法核对事实，会把正确回答误判成幻觉。
+    """
+    return check_chain.invoke({
+        "reply": bot_reply,
+        "question": user_input,
+        "context": context or "（本次没有检索到资料）",
+    }).strip()
 
 
 # ========== 组装：完整流水线 ==========

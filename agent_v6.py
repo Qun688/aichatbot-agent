@@ -24,7 +24,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 
 from tools import retrieve_relevant
@@ -104,6 +104,8 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     safety_passed: bool
     user_id: str
+    quality_passed: bool    # 质检结论（v10.1 起真正参与决策，不再只打日志）
+    quality_note: str       # 质检原文，便于排查
 
 
 # ============================================================
@@ -144,8 +146,21 @@ def agent_node(state: AgentState) -> dict:
 tool_node = ToolNode(tools=TOOLS)
 
 
+# 质检不通过时的兜底话术：宁可承认"把握不够"，也不能把可疑回答直接给用户
+QUALITY_FALLBACK = (
+    "抱歉，这个问题我这边把握不够，为避免给您错误信息，"
+    "建议联系人工客服确认：400-888-6666（周一至周五 9:00-18:00）。"
+)
+
+
 def quality_check(state: AgentState) -> dict:
-    """节点5：质检最后一条 AI 回复"""
+    """节点5：质检最后一条 AI 回复
+
+    v10.1 起不再"白调"：以前只把质检结果 print 一下就丢掉，
+    现在把结论写进 state，由 process_message 决定是否用兜底话术替换 ——
+    「输出护栏」这才算真正生效（发现幻觉/答非所问时不让它触达用户）。
+    注意这里没有新增 LLM 调用，只是把本来就在花的这一次用起来。
+    """
     user_msgs = [m for m in state["messages"] if isinstance(m, HumanMessage)]
     ai_msgs = [m for m in state["messages"] if isinstance(m, AIMessage)]
     if not user_msgs or not ai_msgs:
@@ -153,8 +168,17 @@ def quality_check(state: AgentState) -> dict:
 
     user_input = user_msgs[-1].content
     reply = ai_msgs[-1].content
-    check_output(reply, user_input)  # 质检结果只做日志，不修改消息
-    return {}
+
+    # 把本次检索到的资料一并交给质检 —— 它必须有原文才能判断"有没有编造"，
+    # 否则只能凭自己的知识判断，会把虚构公司知识库里的正确内容误判成幻觉。
+    context = "\n".join(
+        m.content for m in state["messages"]
+        if isinstance(m, ToolMessage) and isinstance(m.content, str)
+    )
+    verdict = check_output(reply, user_input, context)
+    # 容错解析：模型可能输出 "通过" / "**通过**" / "通过。" 等变体
+    passed = verdict.strip().lstrip("*# 　").startswith("通过")
+    return {"quality_passed": passed, "quality_note": verdict}
 
 
 # ============================================================
@@ -316,7 +340,11 @@ def _format_node_event(node_name: str, node_output: dict) -> str:
         return "[工具执行完毕]"
 
     elif node_name == "quality_check":
-        return "[质检完成]"
+        if node_output.get("quality_passed") is True:
+            return "[质检: 通过]"
+        if node_output.get("quality_passed") is False:
+            return "[质检: 不通过 → 护栏介入]"
+        return "[质检: 完成]"
 
     return f"[{node_name}]"
 
@@ -357,12 +385,18 @@ def process_message(user_input: str, thread_id: str = "default", user_id: str = 
         ai_msgs = [m for m in final_state.values.get("messages", [])
                    if isinstance(m, AIMessage)]
         if ai_msgs:
-            reply = ai_msgs[-1].content
+            original_reply = ai_msgs[-1].content
+            reply = original_reply
+
+            # v10.1：质检不过 → 换成兜底话术，别让可疑回答直接触达用户
+            if final_state.values.get("quality_passed") is False:
+                print("  [护栏] 质检未通过，已用安全话术替换可疑回答")
+                reply = QUALITY_FALLBACK
 
             # 对话结束后，用 LLM 提取值得记住的用户信息，存入长期记忆
-            # 先查已有记忆，避免重复提取
+            # 先查已有记忆，避免重复提取（用模型的原始回答，而不是被替换的兜底话术）
             existing = get_user_memory(user_id)
-            memory = extract_memory(user_input, reply, existing)
+            memory = extract_memory(user_input, original_reply, existing)
             if memory:
                 save_user_memory(user_id, memory)
                 print(f"  [记忆: 已记住「{memory}」]")

@@ -1,13 +1,19 @@
 """
-智能客服 Agent v3.0
+智能客服 Agent v3.0 —— 【历史版本，仅供版本演进参考】
 用课5 LangChain 语法重写
+
+⚠️ 这是 v3.0 的老流水线：不含 RAG 混合检索、长期记忆、LangGraph 图编排。
+   当前版本请用：
+     · CLI     → python main_v6.py
+     · 接口/网页 → uvicorn api:app  +  streamlit run app.py
+   保留本文件是为了展示"从管道语法到图编排"的演进过程。
 
 升级对比：
   v1.0: 整个知识库塞进一个 prompt → LLM 直接回答
   v2.0: 手写 if/elif + f-string 链式调用
   v3.0: ChatPromptTemplate + StrOutputParser + | 管道语法
 
-运行方式：python main.py
+运行方式：python main.py（老版本，仅用于回顾早期实现）
 """
 from agent import process_message
 
