@@ -1,17 +1,18 @@
 """
 检索评测脚本 —— 量化 RAG 检索质量
 ====================================
-干什么：
-  用同一套测试问题，对比两种切块策略的检索效果
-    A. 基线（baseline）：整篇文档按 700 字硬切      —— v4.0~v8.0 的老做法
-    B. 现状（current） ：先按【章节】切、【常见问题】按一问一答切 —— v9.1
-  输出 Hit@1 / Hit@3 / MRR 三个指标，以及每道题的命中排名。
-  A→B 的差值，就是可以写进简历的"检索命中率提升 XX%"。
+用同一套 22 道测试题，对比三代检索方案，输出 Hit@1 / Hit@3 / MRR：
+
+  A. 基线       整篇 700 字硬切      + 纯向量检索          （v4.0~v8.0）
+  B. 切块优化   章节 + 一问一答切块  + 纯向量检索          （v9.1）
+  C. 混合+重排  章节 + 一问一答切块  + BM25/向量融合 + 重排（v10.0）
+
+A→B→C 的数字变化，就是可以写进简历的"检索命中率提升 XX%"。
 
 为什么不用 RAGAS：
   RAGAS 的生成类指标要调 LLM 打分，慢、要花钱、结果还不稳定。
-  而"检索有没有捞到正确内容"这件事用关键词判定就足够客观，
-  而且免费、可复现、几秒跑完。先把这一步做扎实，
+  而"检索有没有捞到正确内容"用关键词判定就足够客观，
+  免费、可复现、几秒跑完。先把检索侧做扎实，
   再上 RAGAS 的 faithfulness / answer relevancy 才是有价值的补充。
 
 用法：
@@ -25,6 +26,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import tools
+from retriever import HybridRetriever
 
 # 评测用的向量库目录（跟生产用的 chroma_db 分开，随时可删）
 EVAL_DIR = os.path.join(tools.BASE_DIR, "chroma_db_eval")
@@ -41,7 +43,7 @@ TOP_K = 3
 # 测试集
 #   q      : 用户会怎么问
 #   expect : 正确答案里必然出现的关键词（只要检索到的任意一个块包含它，就算命中）
-#   关键词与切块方式无关，所以两套策略用的是完全公平的同一把尺子
+#   关键词与切块方式无关，所以三套方案用的是完全公平的同一把尺子
 # ============================================================
 TEST_SET = [
     # 【公司信息】
@@ -70,7 +72,7 @@ TEST_SET = [
     {"q": "支持私有化部署吗？", "expect": ["单独购买部署服务"]},
     {"q": "怎么接入钉钉？", "expect": ["集成设置", "单点登录"]},
     {"q": "数据可以导出来吗？", "expect": ["Excel"]},
-    {"q": "同一个账号能不能多人同时登录？", "expect": ["同时仅支持一个设备登录"]},
+    {"q": "同一个账号能不能多人同时登录？", "expect": ["仅支持一个设备登录"]},
     {"q": "支持哪些支付方式？", "expect": ["支付宝", "微信支付"]},
     # 【退换政策】
     {"q": "退款政策是什么？", "expect": ["7 天内支持无理由退款"]},
@@ -88,11 +90,11 @@ def build_baseline_docs() -> list:
     return splitter.create_documents([text])
 
 
-def evaluate(store, label: str) -> dict:
-    """在给定向量库上跑一遍测试集，算 Hit@1 / Hit@k / MRR"""
+def evaluate(search_fn, label: str, chunk_count: int) -> dict:
+    """在给定检索方案上跑一遍测试集，算 Hit@1 / Hit@k / MRR"""
     details = []
     for case in TEST_SET:
-        hits = store.similarity_search(case["q"], k=TOP_K)
+        hits = search_fn(case["q"])
         rank = None
         for i, doc in enumerate(hits, 1):
             if any(kw in doc.page_content for kw in case["expect"]):
@@ -104,11 +106,14 @@ def evaluate(store, label: str) -> dict:
     hit1 = sum(1 for d in details if d["rank"] == 1) / n
     hitk = sum(1 for d in details if d["rank"] is not None) / n
     mrr = sum(1.0 / d["rank"] for d in details if d["rank"]) / n
-    return {"label": label, "hit1": hit1, "hitk": hitk, "mrr": mrr, "details": details}
+    return {
+        "label": label, "hit1": hit1, "hitk": hitk, "mrr": mrr,
+        "details": details, "chunks": chunk_count,
+    }
 
 
-def print_result(res: dict, total_chunks: int):
-    print(f"\n【{res['label']}】共 {total_chunks} 个块")
+def print_result(res: dict):
+    print(f"\n【{res['label']}】共 {res['chunks']} 个块")
     print(f"  Hit@1 : {res['hit1'] * 100:5.1f}%   （第一名就命中）")
     print(f"  Hit@{TOP_K} : {res['hitk'] * 100:5.1f}%   （前 {TOP_K} 名内命中）")
     print(f"  MRR   : {res['mrr']:.3f}   （命中越靠前越高，满分 1.000）")
@@ -125,14 +130,23 @@ def print_result(res: dict, total_chunks: int):
             print(f"    - {d['q']}   （期望关键词：{d['keyword']}）")
 
 
+def print_delta(before: dict, after: dict, title: str):
+    print(f"\n  {title}")
+    print(f"    Hit@1 : {before['hit1'] * 100:.1f}%  →  {after['hit1'] * 100:.1f}%"
+          f"   （{(after['hit1'] - before['hit1']) * 100:+.1f} 个百分点）")
+    print(f"    Hit@{TOP_K} : {before['hitk'] * 100:.1f}%  →  {after['hitk'] * 100:.1f}%"
+          f"   （{(after['hitk'] - before['hitk']) * 100:+.1f} 个百分点）")
+    print(f"    MRR   : {before['mrr']:.3f}  →  {after['mrr']:.3f}")
+
+
 def main():
     # 每次重建，保证结果可复现
     if os.path.exists(EVAL_DIR):
         shutil.rmtree(EVAL_DIR, ignore_errors=True)
 
-    print("=" * 62)
-    print("  RAG 检索评测：基线切块 vs 章节+问答切块")
-    print("=" * 62)
+    print("=" * 66)
+    print("  RAG 检索评测：三代方案对比")
+    print("=" * 66)
 
     embeddings = tools._load_embeddings()
 
@@ -148,22 +162,34 @@ def main():
         collection_name="current", persist_directory=EVAL_DIR,
     )
 
-    base_res = evaluate(baseline_store, "基线：整篇 700 字硬切")
-    curr_res = evaluate(current_store, "现状：章节 + 一问一答切块")
+    # 方案 C：混合检索 + 重排（重排模型加载失败会自动降级成纯混合检索）
+    hybrid = HybridRetriever(current_store, use_rerank=True)
 
-    print_result(base_res, len(baseline_docs))
-    print_result(curr_res, len(current_docs))
+    res_a = evaluate(
+        lambda q: baseline_store.similarity_search(q, k=TOP_K),
+        "A. 基线：整篇 700 字硬切 + 纯向量",
+        len(baseline_docs),
+    )
+    res_b = evaluate(
+        lambda q: current_store.similarity_search(q, k=TOP_K),
+        "B. 切块优化：章节+问答切块 + 纯向量",
+        len(current_docs),
+    )
+    res_c = evaluate(
+        lambda q: hybrid.search(q, k=TOP_K),
+        "C. 混合检索+重排：章节+问答切块",
+        len(current_docs),
+    )
 
-    print("\n" + "=" * 62)
+    for res in (res_a, res_b, res_c):
+        print_result(res)
+
+    print("\n" + "=" * 66)
     print("  对比结论")
-    print("=" * 62)
-    print(f"  Hit@1 : {base_res['hit1'] * 100:.1f}%  →  {curr_res['hit1'] * 100:.1f}%"
-          f"   （{'+' if curr_res['hit1'] >= base_res['hit1'] else ''}"
-          f"{(curr_res['hit1'] - base_res['hit1']) * 100:.1f} 个百分点）")
-    print(f"  Hit@{TOP_K} : {base_res['hitk'] * 100:.1f}%  →  {curr_res['hitk'] * 100:.1f}%"
-          f"   （{'+' if curr_res['hitk'] >= base_res['hitk'] else ''}"
-          f"{(curr_res['hitk'] - base_res['hitk']) * 100:.1f} 个百分点）")
-    print(f"  MRR   : {base_res['mrr']:.3f}  →  {curr_res['mrr']:.3f}")
+    print("=" * 66)
+    print_delta(res_a, res_b, "A → B（切块策略优化的贡献）")
+    print_delta(res_b, res_c, "B → C（混合检索 + 重排的贡献）")
+    print_delta(res_a, res_c, "A → C（累计提升，简历上写这个）")
     print(f"\n  测试集共 {len(TEST_SET)} 道题，检索条数 k={TOP_K}")
 
 

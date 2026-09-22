@@ -9,6 +9,8 @@ v9.0: 切块改为"先按【章节】切、再在章节内细分"，修掉检索
 v9.1: 【常见问题】改为按"一问一答"切块，问题不再被合并稀释
       （v9.0 实测"怎么开发票"检索不到，就是因为发票那条问答
         和支付方式、数据导出等 4 条不相关的问答挤在同一个块里）
+v10.0: 检索升级为"BM25 字面匹配 + 向量语义匹配（RRF 融合）+ cross-encoder 重排"，
+       实现在 retriever.py；量化评测见 evaluate_retrieval.py
 
 【v9.0 修的是什么】
 旧代码用 RecursiveCharacterTextSplitter 直接对整篇文档按 700 字硬切，
@@ -71,6 +73,7 @@ LEGACY_COLLECTIONS = ["langchain"]
 
 # ========== 全局单例：只加载一次 ==========
 _vectorstore = None
+_retriever = None      # 混合检索器（BM25 + 向量 + 重排），首次检索时构建
 
 
 def _count(store) -> int:
@@ -280,12 +283,22 @@ def _init_vectorstore(force_rebuild: bool = False):
 
 def retrieve_relevant(query: str, k: int = 3) -> str:
     """
-    语义检索：搜索与 query 最相关的文档段落（课6 L4）
-    替代 v3.0 的 search_knowledge_base() 关键词匹配
+    检索与 query 最相关的文档段落
+
+    v4.0 ：纯向量语义检索（课6 L4）
+    v10.0：升级为"BM25 字面匹配 + 向量语义匹配（RRF 融合）+ cross-encoder 重排"。
+           起因是评测脚本实测出纯向量的两个固有弱点：
+           专有名词（问"客服电话是多少"）和否定表述（答案"仅支持一个设备登录"
+           被问成"能多人同时登录吗"）都检索不到。实现在 retriever.py 里。
     """
+    global _retriever
     _init_vectorstore()
-    chunks = _vectorstore.similarity_search(query, k=k)
-    return "\n---\n".join([chunk.page_content for chunk in chunks])
+    if _retriever is None:
+        from retriever import HybridRetriever
+
+        _retriever = HybridRetriever(_vectorstore)
+    docs = _retriever.search(query, k=k)
+    return "\n---\n".join(doc.page_content for doc in docs)
 
 
 if __name__ == "__main__":
